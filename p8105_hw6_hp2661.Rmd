@@ -1,0 +1,271 @@
+---
+title: "p8105_hw6_hp2661"
+author: "Huizhong Peng"
+date: "2024-12-02"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(rvest)
+library(ggplot2)
+library(modelr)
+library(mgcv)
+
+options(scipen = 999)
+
+knitr::opts_chunk$set(
+        collapse = TRUE, 
+        message = FALSE, 
+        warning = FALSE,
+  fig.width = 6,
+  fig.asp = .6,
+  out.width = "90%"
+  )
+
+theme_set(theme_minimal() + theme(legend.position = "bottom"))
+
+options(
+  ggplot2.continuous.colour = "viridis",
+  ggplot2.continuous.fill = "viridis"
+)
+
+scale_colour_discrete = scale_colour_viridis_d
+scale_fill_discrete = scale_fill_viridis_d
+```
+
+### Problem 1
+
+```{r}
+weather_df = 
+  rnoaa::meteo_pull_monitors(
+    c("USW00094728"),
+    var = c("PRCP", "TMIN", "TMAX"), 
+    date_min = "2017-01-01",
+    date_max = "2017-12-31") %>%
+  mutate(
+    name = recode(id, USW00094728 = "CentralPark_NY"),
+    tmin = tmin / 10,
+    tmax = tmax / 10) %>%
+  select(name, id, everything())
+
+boot_sample = function(df) {
+  sample_frac(df, replace = TRUE)
+}
+
+quantity = function(model) {
+  r_sq = broom::glance(model)$r.squared
+  beta_0 = broom::tidy(model) |> filter(term == "(Intercept)") |> pull(estimate)
+  beta_1 = broom::tidy(model) |> filter(term == "tmin") |> pull(estimate)
+  log_beta = log(abs(beta_0*beta_1))
+  
+  tibble(r_squared = r_sq, log_beta)
+}
+
+boot_straps = 
+  tibble(strap_number = 1:5000) |> 
+  mutate(
+    strap_sample = map(strap_number, \(i) boot_sample(df = weather_df))
+  )
+
+bootstrap_results = 
+  boot_straps |> 
+  mutate(
+    models = map(strap_sample, \(df) lm(tmax ~ tmin, data = df)),
+    results = map(models, quantity)
+  ) |> 
+  select(-strap_sample, -models) |> 
+  unnest(results) 
+
+# plot
+bootstrap_results |> 
+  ggplot(aes(x = r_squared)) +
+  geom_histogram(fill = "skyblue", color = "black") +
+  labs(title = "Distribution of r^2", x = "r^2", y = "Frequency")
+
+bootstrap_results |> 
+  ggplot(aes(x = log_beta)) +
+  geom_histogram(fill = "pink", color = "black") +
+  labs(title = "Distribution of log beta", x = "log beta", y = "Frequency")
+```
+
+These quantities are normal distributed.
+
+### Problem 2
+
+Baltimore:
+
+```{r}
+url = "https://raw.githubusercontent.com/washingtonpost/data-homicides/refs/heads/master/homicide-data.csv"
+raw_dat = read_csv(url, na = c("Unknown", ""))
+
+write.csv(raw_dat, "data/homicide_raw_data.csv", row.names = FALSE)
+
+# data cleaning
+dat = raw_dat |> 
+  janitor::clean_names() |> 
+  mutate(
+    city_state = paste(city, state, sep = ", "),
+    resolved = ifelse(disposition == "Closed by arrest", 1, 0),
+    victim_age = as.numeric(victim_age)
+  ) |> 
+  filter(!city_state %in% c("Dallas, TX", "Phoenix, AZ", "Kansas City, MO", "Tulsa, AL")) |> 
+  filter(victim_race %in% c("White", "Black"))
+
+bal = dat |> 
+  filter(city_state == "Baltimore, MD") |> 
+  select(uid, resolved, victim_age, victim_sex, victim_race)
+
+# glm
+bal_fit_log = bal |> 
+  glm(resolved ~ victim_age + victim_sex + victim_race, 
+      data = _, family = binomial())
+
+bal_fit_log |> 
+  broom::tidy() |> 
+  knitr::kable(digits = 3)
+
+bal_sex_OR = 
+  bal_fit_log |>
+  broom::tidy(conf.int = TRUE, exponentiate = TRUE) |> 
+  select(term, OR = estimate, std = std.error, 
+         ci_low = conf.low, ci_high = conf.high) |> 
+  filter(term == "victim_sexMale") |> 
+  knitr::kable(digits = 3)
+
+bal_sex_OR
+```
+
+All cities:
+
+```{r}
+fit_log = function(data){
+  model = glm(resolved ~ victim_age + victim_sex + victim_race, 
+              data = data, family = binomial())
+  
+  model |> 
+    broom::tidy(conf.int = TRUE, exponentiate = TRUE) |> 
+    select(term, OR = estimate, std = std.error, 
+           ci_low = conf.low, ci_high = conf.high) |> 
+    filter(term == "victim_sexMale")
+}
+
+dat_nest = dat |> 
+  group_by(city_state) |> 
+  nest() 
+
+all_sex_OR = 
+  dat_nest |> 
+  mutate(
+    model = map(data, fit_log)
+  ) |> 
+  unnest(model) |> 
+  select(city_state, OR, std, ci_low, ci_high) |> 
+  tibble()
+
+all_sex_OR |> 
+  knitr::kable(digits = 3)
+```
+
+Plot: 
+
+```{r}
+all_sex_OR |> 
+  mutate(
+    city_state = fct_reorder(city_state, OR)
+  ) |> 
+  ggplot(aes(x = city_state, y = OR)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.5) +
+  labs(
+    title = "Adjusted Odds Ratios for Solving Homicides by City",
+    x = "City",
+    y = "Odds Ratio (Male vs Female)"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1)
+  )
+```
+
+Adjusted odds Ratios in most cities are less than 1, showing that there are more female victims than male victims keeping all other variables fixed.
+
+New York City has the lowest adjusted OR and Albuquerque City has the highest adjusted OR.
+
+### Problem 3
+
+```{r}
+bwt_df = 
+  read_csv("data/birthweight.csv", 
+           col_types = cols(
+             babysex = "c", frace = "c", malform = "c", mrace = "c"))
+
+skimr::skim(bwt_df)
+
+model = lm(bwt ~ bhead + blength + babysex + delwt + fincome + frace + gaweeks + malform + mrace + ppbmi + ppwt + smoken + wtgain, 
+         data = bwt_df)
+summary(model)
+```
+
+Remain significant variables (e.g., `bhead`, `blength`, `babysex`) in final regression model.
+
+```{r}
+final_model = lm(bwt ~ bhead + blength + babysex + delwt + gaweeks + mrace + ppbmi + smoken,
+              data = bwt_df)
+summary(final_model)
+
+bwt_df = bwt_df |> 
+  add_predictions(final_model) |> 
+  add_residuals(final_model)
+
+# plot
+bwt_df |> 
+  ggplot(aes(x = pred, y = resid)) +
+  geom_point(alpha = .3) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(
+    title = "Residuals vs Fitted Values",
+    x = "Fitted Values",
+    y = "Residuals"
+  )
+```
+
+Compare this model to other models:
+
+```{r}
+model1 = lm(bwt ~ blength + gaweeks,
+            data = bwt_df)
+summary(model1)
+model2 = lm(bwt ~ bhead + blength + babysex + bhead*blength + bhead*babysex + blength*babysex + bhead*blength*babysex,
+            data = bwt_df)
+summary(model2)
+
+cv_df = 
+  crossv_mc(bwt_df, 100) |> 
+  mutate(
+    train = map(train, as_tibble),
+    test = map(test, as_tibble)
+  )
+
+cv_df = 
+  cv_df |> 
+  mutate(
+    mod_f = map(train, \(df) final_model),
+    mod_1 = map(train, \(df) model1),
+    mod_2 = map(train, \(df) model2)) |> 
+  mutate(
+    rmse_my = map2_dbl(mod_f, test, \(mod, df) rmse(model = mod, data = df)),
+    rmse_main = map2_dbl(mod_1, test, \(mod, df) rmse(model = mod, data = df)),
+    rmse_interaction = map2_dbl(mod_2, test, \(mod, df) rmse(model = mod, data = df)))
+
+cv_df |> 
+  select(starts_with("rmse")) |> 
+  pivot_longer(
+    everything(),
+    names_to = "model", 
+    values_to = "rmse",
+    names_prefix = "rmse_") |> 
+  mutate(model = fct_inorder(model)) |> 
+  ggplot(aes(x = model, y = rmse)) + geom_violin()
+```
+
+The model containing `bhead`, `blength`, `babysex`, `delwt`, `gaweeks`, `mrace`, `ppbmi` and `smoken` has the lowest rmse. 
